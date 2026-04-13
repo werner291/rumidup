@@ -36,6 +36,10 @@ pub struct Config {
     #[clap(short = 'm', long, value_name = "FILE", display_order = 3)]
     pub metrics: Option<PathBuf>,
 
+    /// Sample name to include in JSON metrics output.
+    #[clap(short = 's', long, value_name = "NAME", display_order = 4)]
+    pub sample_name: Option<String>,
+
     /// Ignore previous duplicate marking applied to BAM file. This information is extracted from
     /// the header. Use --force to redo duplicate marking.
     #[clap(short, long, display_order = 50)]
@@ -402,7 +406,8 @@ impl App {
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
             {
-                self.metrics.write_json(mout)?;
+                self.metrics
+                    .write_json(&mut mout, self.config.sample_name.as_deref())?;
             } else {
                 use std::io::Write;
                 write!(mout, "{}", self.metrics)?;

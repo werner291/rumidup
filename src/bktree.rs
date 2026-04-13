@@ -308,7 +308,7 @@ mod tests {
         let mut from_root = tree.get_children(0);
         from_root.sort();
         assert_eq!(from_root, vec![1, 2, 3]);
-        assert_eq!(tree.get_children(2), vec![]);
+        assert_eq!(tree.get_children(2), Vec::<usize>::new());
         assert_eq!(tree.get_children(1), vec![3]);
     }
 

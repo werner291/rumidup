@@ -1,7 +1,29 @@
 use std::fmt;
 use std::io::{Error as IoError, Write};
 
+use serde::Serialize;
+
 use crate::record::Flags;
+
+/// Serializable metrics report. Produced from [`Metrics`] for JSON output.
+/// Field names match the existing hand-rolled JSON and Picard-style TSV headers.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub struct MetricsReport<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_name: Option<&'a str>,
+    pub unpaired_reads_examined: usize,
+    pub paired_reads_examined: usize,
+    pub secondary_or_supplementary_rds: usize,
+    pub unmapped_reads: usize,
+    pub unpaired_read_duplicates: usize,
+    pub unpaired_read_optical_duplicates: usize,
+    pub read_pair_duplicates: usize,
+    pub read_pair_optical_duplicates: usize,
+    pub corrected_umis: usize,
+    pub fraction_duplication: Option<f32>,
+    pub estimated_library_size: u64,
+}
 
 /// Duplication metrics.
 #[derive(Debug, Default)]
@@ -159,7 +181,32 @@ impl Metrics {
         }
     }
 
-    pub fn write_json<W: Write>(&self, mut w: W) -> Result<(), IoError> {
+    pub fn to_report<'a>(&self, sample_name: Option<&'a str>) -> MetricsReport<'a> {
+        let frac = self.fraction_duplication();
+        MetricsReport {
+            sample_name,
+            unpaired_reads_examined: self.unpaired_reads_examined,
+            paired_reads_examined: self.paired_reads_examined,
+            secondary_or_supplementary_rds: self.secondary_or_supplementary_rds,
+            unmapped_reads: self.unmapped_reads,
+            unpaired_read_duplicates: self.unpaired_read_duplicates,
+            unpaired_read_optical_duplicates: self.unpaired_read_optical_duplicates,
+            read_pair_duplicates: self.read_pair_duplicates,
+            read_pair_optical_duplicates: self.read_pair_optical_duplicates,
+            corrected_umis: self.corrected_umis,
+            fraction_duplication: if frac.is_finite() { Some(frac) } else { None },
+            estimated_library_size: self.estimated_library_size(),
+        }
+    }
+
+    pub fn write_json<W: Write>(&self, w: W, sample_name: Option<&str>) -> Result<(), IoError> {
+        serde_json::to_writer(w, &self.to_report(sample_name))
+            .map_err(|e| IoError::new(std::io::ErrorKind::Other, e))
+    }
+
+    /// Legacy hand-rolled JSON, kept for testing equivalence with serde output.
+    #[cfg(test)]
+    fn write_json_legacy<W: Write>(&self, mut w: W) -> Result<(), IoError> {
         writeln!(w, "{{\"UNPAIRED_READS_EXAMINED\":{}, \"PAIRED_READS_EXAMINED\":{}, \"SECONDARY_OR_SUPPLEMENTARY_RDS\":{}, \"UNMAPPED_READS\":{}, \"UNPAIRED_READ_DUPLICATES\":{}, \"UNPAIRED_READ_OPTICAL_DUPLICATES\":{}, \"READ_PAIR_DUPLICATES\":{}, \"READ_PAIR_OPTICAL_DUPLICATES\":{}, \"CORRECTED_UMIS\":{}, \"FRACTION_DUPLICATION\":{}, \"ESTIMATED_LIBRARY_SIZE\":{}}}",
             self.unpaired_reads_examined,
             self.paired_reads_examined,
@@ -172,5 +219,86 @@ impl Metrics {
             self.corrected_umis,
             self.fraction_duplication(),
             self.estimated_library_size())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_metrics() -> Metrics {
+        let mut m = Metrics::default();
+        m.unpaired_reads_examined = 1000;
+        m.paired_reads_examined = 5000;
+        m.secondary_or_supplementary_rds = 50;
+        m.unmapped_reads = 30;
+        m.unpaired_read_duplicates = 100;
+        m.unpaired_read_optical_duplicates = 10;
+        m.read_pair_duplicates = 400;
+        m.read_pair_optical_duplicates = 40;
+        m.corrected_umis = 25;
+        m
+    }
+
+    #[test]
+    fn serde_matches_legacy_json_values() {
+        let m = make_metrics();
+
+        // Legacy output (may contain NaN for zero-read case, so test with real data)
+        let mut legacy_buf = Vec::new();
+        m.write_json_legacy(&mut legacy_buf).unwrap();
+        let legacy: serde_json::Value = serde_json::from_slice(&legacy_buf).unwrap();
+
+        // New serde output (without sample_name, to match legacy fields)
+        let mut serde_buf = Vec::new();
+        m.write_json(&mut serde_buf, None).unwrap();
+        let new: serde_json::Value = serde_json::from_slice(&serde_buf).unwrap();
+
+        // Compare every field that exists in the legacy output
+        let legacy_obj = legacy.as_object().unwrap();
+        let new_obj = new.as_object().unwrap();
+        assert_eq!(
+            legacy_obj.len(),
+            new_obj.len(),
+            "field count mismatch: legacy has {}, new has {}",
+            legacy_obj.len(),
+            new_obj.len()
+        );
+        for (key, legacy_val) in legacy_obj {
+            let new_val = new_obj
+                .get(key)
+                .unwrap_or_else(|| panic!("missing key: {key}"));
+            assert_eq!(
+                legacy_val, new_val,
+                "mismatch for {key}: legacy={legacy_val}, new={new_val}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_reads_emits_null_fraction() {
+        let m = Metrics::default();
+        let mut buf = Vec::new();
+        m.write_json(&mut buf, None).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(val["FRACTION_DUPLICATION"].is_null());
+    }
+
+    #[test]
+    fn json_includes_sample_name_when_provided() {
+        let m = make_metrics();
+        let mut buf = Vec::new();
+        m.write_json(&mut buf, Some("sample_42")).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(val["SAMPLE_NAME"], "sample_42");
+    }
+
+    #[test]
+    fn json_omits_sample_name_when_none() {
+        let m = make_metrics();
+        let mut buf = Vec::new();
+        m.write_json(&mut buf, None).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert!(val.get("SAMPLE_NAME").is_none());
     }
 }
